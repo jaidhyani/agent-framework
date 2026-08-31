@@ -661,6 +661,9 @@ export class AgentFramework {
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
   private mcplInferenceRoutingConfig: import('./mcpl/types.js').InferenceRoutingPolicy | null = null;
+  /** Configured last-resort speech locus (FrameworkConfig.fallbackLocusChannel).
+   *  Held on the framework so a runtime MCPL re-init keeps it. */
+  private fallbackLocusChannel: string | null = null;
   /** Durable, non-Chronicle projection queue for messages removed by a branch. */
   private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
@@ -913,6 +916,7 @@ export class AgentFramework {
     // Stored for lazy MCPL initialization (connectMcplServer on a framework
     // that started with zero configured servers).
     framework.mcplInferenceRoutingConfig = config.inferenceRouting ?? null;
+    framework.fallbackLocusChannel = config.fallbackLocusChannel ?? null;
 
     // Client-side programmatic tool calling (code_execution). Config is only
     // retained when enabled — everything downstream gates on the field.
@@ -3327,9 +3331,31 @@ export class AgentFramework {
     const agent = new Agent(config, contextManager, this.membrane);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
-      agent.restoreRuntimeSettings(
-        this.validatePersistedAgentRuntimeSettings(config.name, restoredSettings),
-      );
+      // Local patch 2026-08-29 (stale-budget-override-on-restore): a persisted
+      // contextBudgetTokens override BELOW the configured budget replays as a
+      // DECREASE at boot, arming a gradual window transition that non-kv-stable
+      // strategies reject — a hard crash loop (hit live when Saga's recipe went
+      // 176000 -> 250000 under lsm-compaction). The recipe is the durable
+      // intent: drop the stale override for this boot, loudly, in memory only
+      // (no store write). Clearing it durably is the runtime tool's job.
+      const cfgBudget = config.contextBudgetTokens;
+      if (
+        restoredSettings.contextBudgetTokens !== undefined &&
+        cfgBudget !== undefined &&
+        restoredSettings.contextBudgetTokens < cfgBudget
+      ) {
+        console.error(
+          `[runtime-settings] dropping persisted contextBudgetTokens override ` +
+          `(${restoredSettings.contextBudgetTokens}) for "${config.name}" — below configured ` +
+          `${cfgBudget}; recipe intent wins on restore`,
+        );
+        delete restoredSettings.contextBudgetTokens;
+      }
+      if (Object.keys(restoredSettings).length > 0) {
+        agent.restoreRuntimeSettings(
+          this.validatePersistedAgentRuntimeSettings(config.name, restoredSettings),
+        );
+      }
     }
     this.agents.set(config.name, agent);
     this.agentConfigs.set(config.name, config);
@@ -6905,6 +6931,12 @@ export class AgentFramework {
         // a concurrent message in another channel hijacks it. Empty for
         // heartbeat / no-trigger turns → correct global fallback.
         activeChannelResolver: (agentName) => this.activeTriggerChannels.get(agentName),
+        // Last resort when the three live resolvers are all empty: the
+        // deployment's one configured door. `defaultPublishChannel` is
+        // in-memory, so it is null from boot until the first inbound —
+        // exactly the window in which a heartbeat / workspace-event wake
+        // used to have nowhere to speak. Unset → unchanged never-guess.
+        ...(this.fallbackLocusChannel ? { fallbackLocusChannel: this.fallbackLocusChannel } : {}),
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.

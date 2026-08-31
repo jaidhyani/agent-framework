@@ -71,6 +71,15 @@ interface PendingEvent {
    *  a [Gate:] copy delivered minutes later reads as a fresh, stale duplicate
    *  of a message the agent may have long since handled. */
   inContext: boolean;
+  /** The event is addressed TO the agent — an @-mention, a DM / private
+   *  message, or a reply to something it said. An addressed event ALWAYS
+   *  wakes the agent, even when its content is already in the context window
+   *  and the batch would otherwise be suppressed as empty (see
+   *  `GateConfig.suppressEmptyBatchedWakes`). Read from the event's metadata
+   *  flags OR from the RFC-001 `chat:*` tag set — either alone is sufficient.
+   *  A missed wake is worse than a wasted one, so anything that looks
+   *  addressed by either route counts as addressed. */
+  addressed: boolean;
   channelId?: string;
   /** Human-readable channel name (e.g. Discord channel name) when the event's
    *  metadata carries one — batched-wake lines render this instead of the raw
@@ -81,6 +90,51 @@ interface PendingEvent {
 interface DebounceState {
   timer: ReturnType<typeof setTimeout>;
   events: PendingEvent[];
+}
+
+/** Metadata flags that mean "this event is addressed to the agent". Any one
+ *  of them is enough. Sourced from the Discord MCPL's own emission
+ *  (`isMention` covers explicit @-mention OR reply-to-bot; `isDM` covers
+ *  private messages), plus the two spellings other MCPLs have used. */
+const ADDRESSED_METADATA_FLAGS = [
+  'isMention',
+  'isDM',
+  'isDm',
+  'isPrivate',
+  'isReplyToBot',
+  'isDirect',
+] as const;
+
+/** RFC-001 chat tags that mean the same thing. `chat:addressed` is the
+ *  umbrella the Discord MCPL sets for `isMention || isDM`; the rest are
+ *  listed so a source that emits only the specific tag still counts. */
+const ADDRESSED_TAGS = new Set([
+  'chat:addressed',
+  'chat:mention',
+  'chat:reply',
+  'chat:dm',
+  'chat:private',
+]);
+
+/**
+ * Whether an event is addressed to the agent, by EITHER route (metadata flag
+ * or tag). Deliberately generous: this predicate exists only to protect a
+ * wake from suppression, so a false positive costs one wake and a false
+ * negative costs a missed message. When in doubt, addressed.
+ */
+function isAddressedEvent(info: GateEventInfo): boolean {
+  const md = info.metadata;
+  if (md) {
+    for (const flag of ADDRESSED_METADATA_FLAGS) {
+      if (md[flag]) return true;
+    }
+  }
+  if (info.tags) {
+    for (const tag of info.tags) {
+      if (ADDRESSED_TAGS.has(tag)) return true;
+    }
+  }
+  return false;
 }
 
 /** Token bucket for one (policy, key) pair under a rate_limit behavior. */
@@ -196,7 +250,14 @@ function validateConfig(raw: unknown): GateConfig {
     }
   }
 
-  return { policies, default: defaultBehavior };
+  // Default TRUE: a wake whose own text says "not new content" has nothing to
+  // offer. Explicit `false` restores the always-wake behavior. Anything else
+  // (absent, null, a typo) takes the default rather than throwing — this is a
+  // wake-frequency preference, not a correctness knob, and refusing to parse
+  // gate.json over it would cost more than the setting is worth.
+  const suppressEmptyBatchedWakes = obj.suppressEmptyBatchedWakes !== false;
+
+  return { policies, default: defaultBehavior, suppressEmptyBatchedWakes };
 }
 
 function validatePolicy(raw: unknown): GatePolicy {
@@ -1032,6 +1093,7 @@ export class EventGate {
       eventType: info.eventType,
       timestamp: Date.now(),
       inContext: info.eventType === 'mcpl:channel-incoming' || info.eventType === 'mcpl:push-event',
+      addressed: isAddressedEvent(info),
       channelId: info.channelId || undefined,
       channelLabel:
         typeof info.metadata?.channelName === 'string' && info.metadata.channelName
@@ -1092,6 +1154,59 @@ export class EventGate {
     // Only events with no context entry of their own carry their content.
     const quoted = events.filter(e => !e.inContext);
     const referenced = events.filter(e => e.inContext);
+
+    // ---------------------------------------------------------------------
+    // WAKE DEDUP AT THE GATE (2026-08-28 — Jai's ask, Saga's rig).
+    //
+    // If EVERY event in this batch is already in the context window, the
+    // message we are about to write says as much in its own words ("already
+    // shown above at arrival; this is a batched wake, not new content") and
+    // then wakes the agent anyway. Measured on Saga's rig: every batched
+    // wake carrying a reference line carried NOTHING else — 8 of 8 in the
+    // sample were pure no-ops, and ~23% of her turns produced nothing.
+    //
+    // Suppression here is LOSSLESS, which is the whole reason it is safe:
+    // the content is already in the window. The agent reads it on the next
+    // wake that has a reason of its own. Nothing is dropped, deferred, or
+    // summarized away — only the *interrupt* is withheld.
+    //
+    // WHAT IS NEVER SUPPRESSED (deliberately conservative — a missed wake is
+    // worse than a wasted one):
+    //   - any batch containing an event NOT already in context (`quoted`),
+    //     however small;
+    //   - any batch containing an addressed event — @-mention, DM/private,
+    //     or reply-to-bot — even though its content is already in context;
+    //   - anything at all when `suppressEmptyBatchedWakes` is false.
+    // Non-debounced policies never reach this method, so `behavior: always`
+    // (which is how mentions and DMs are routed on this rig) is untouched.
+    // ---------------------------------------------------------------------
+    if (
+      this.config.suppressEmptyBatchedWakes !== false &&
+      quoted.length === 0 &&
+      !events.some(e => e.addressed)
+    ) {
+      const policyList = policyNames.join(',');
+      const channels = [...new Set(referenced.map(e => e.channelLabel ?? e.channelId ?? '?'))];
+      // stderr, not the host's structured log — this is the surface the rest
+      // of the rig's cost instrumentation reads (cf. [kv-escalation],
+      // [estimator-calibration]), and the count of these lines IS the
+      // "no-op wakes avoided" metric.
+      console.error(
+        `[gate-dedup] suppressed empty batched wake: ${events.length} event` +
+          `${events.length > 1 ? 's' : ''} already in context ` +
+          `(policies=${policyList} channels=${channels.join(',')})`,
+      );
+      this.emitTrace({
+        type: 'gate:decision',
+        eventType: 'gate:wake-suppressed',
+        channelId: referenced[0]?.channelId,
+        matchedPolicy: policyNames[0] ?? null,
+        trigger: false,
+        behavior: 'suppressed-empty-batch',
+        timestamp: Date.now(),
+      });
+      return;
+    }
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     if (referenced.length > 0) {

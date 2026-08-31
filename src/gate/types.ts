@@ -129,6 +129,26 @@ export interface GateConfig {
   policies: GatePolicy[];
   /** Behavior when no policy matches. Default: 'always'. */
   default?: 'always' | 'defer' | 'skip';
+  /**
+   * Suppress a debounced wake whose entire batch is already in the context
+   * window. Default: true.
+   *
+   * The framework stores MCPL channel-incoming / push-event content at
+   * ARRIVAL, before the gate decides anything. When a debounce window closes
+   * and every event in it is one of those, the delivered message says so in
+   * its own words — "already shown above at arrival; this is a batched wake,
+   * not new content" — and then wakes the agent anyway. That wake cannot
+   * produce anything the agent could not already see, but it costs a full
+   * turn plus the context ratchet of the `[Gate:]` message itself.
+   *
+   * Suppressing it is lossless: the content stays in the context window and
+   * is read on the next wake that has a reason. Addressed events (mention /
+   * DM / reply-to-bot) are NEVER suppressed — see `PendingEvent.addressed`.
+   *
+   * Set to false to restore the always-wake behavior. Hot-reloaded with the
+   * rest of gate.json, so flipping it does not need a restart.
+   */
+  suppressEmptyBatchedWakes?: boolean;
 }
 
 // ---------------------------------------------------------------------------
