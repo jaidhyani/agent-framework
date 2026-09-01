@@ -661,6 +661,9 @@ export class AgentFramework {
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
   private mcplInferenceRoutingConfig: import('./mcpl/types.js').InferenceRoutingPolicy | null = null;
+  /** Configured last-resort speech locus (FrameworkConfig.fallbackLocusChannel).
+   *  Held on the framework so a runtime MCPL re-init keeps it. */
+  private fallbackLocusChannel: string | null = null;
   /** Durable, non-Chronicle projection queue for messages removed by a branch. */
   private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
@@ -913,6 +916,7 @@ export class AgentFramework {
     // Stored for lazy MCPL initialization (connectMcplServer on a framework
     // that started with zero configured servers).
     framework.mcplInferenceRoutingConfig = config.inferenceRouting ?? null;
+    framework.fallbackLocusChannel = config.fallbackLocusChannel ?? null;
 
     // Client-side programmatic tool calling (code_execution). Config is only
     // retained when enabled — everything downstream gates on the field.
@@ -6905,6 +6909,12 @@ export class AgentFramework {
         // a concurrent message in another channel hijacks it. Empty for
         // heartbeat / no-trigger turns → correct global fallback.
         activeChannelResolver: (agentName) => this.activeTriggerChannels.get(agentName),
+        // Last resort when the three live resolvers are all empty: the
+        // deployment's one configured door. `defaultPublishChannel` is
+        // in-memory, so it is null from boot until the first inbound —
+        // exactly the window in which a heartbeat / workspace-event wake
+        // used to have nowhere to speak. Unset → unchanged never-guess.
+        ...(this.fallbackLocusChannel ? { fallbackLocusChannel: this.fallbackLocusChannel } : {}),
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.
@@ -8107,6 +8117,30 @@ export class AgentFramework {
           reject(`This conversation is bound to channel ${home}; ${verb} ${input.channelId} is not allowed.`);
           return;
         }
+      }
+    }
+
+    // [local patch 2026-09-01 clai] Trunk agents: a channel_publish with no
+    // channelId must land on the turn's locus (home → trigger channel →
+    // most-recent inbound → configured fallbackLocusChannel, frozen at turn
+    // start into turnLocusPins), not on the raw
+    // process-global defaultPublishChannel that handleToolPublish falls back
+    // to. That fallback tracks only SUBSCRIBED inbound, so a reply to a mention
+    // in an unsubscribed channel landed in whichever channel last had
+    // subscribed traffic (Aesop, 2026-08-02: #journal-club → #kitchen-table),
+    // and right after a boot it is null. This is the tool-path half of the
+    // fallback-locus fix; routeSpeech already resolves the same way.
+    if (!home && call.name === 'channel_publish') {
+      const input = (call.input ?? {}) as { channelId?: string };
+      if (!input.channelId) {
+        // Read the turn's FROZEN pin (set at turn start, framework.ts
+        // startAgentStream), never re-resolve live: a late dispatch resolving
+        // live can read the next turn's trigger or a moved global default —
+        // the item-3 / 2026-07-22 Sol DM misroute routeSpeech's contract
+        // guards against. Same convention as dispatchSleepToolCall. Agents in
+        // explicit-prose routing have no pin and fall through unchanged.
+        const locus = this.turnLocusPins.get(agentName) ?? null;
+        if (locus !== null) call = { ...call, input: { ...input, channelId: locus } };
       }
     }
 

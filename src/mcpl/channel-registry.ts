@@ -331,6 +331,23 @@ interface ChannelRegistryOptions {
    * wins), BEFORE `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
+  /**
+   * Static last-resort outbound locus, configured by the deployment
+   * (`FrameworkConfig.fallbackLocusChannel`). Consulted LAST — after home,
+   * trigger channel, and `defaultPublishChannel` — and only when all three
+   * are empty.
+   *
+   * `defaultPublishChannel` tracks the most-recent inbound and is in-memory
+   * only, so it is `null` for the whole window between a restart and the
+   * first inbound message. A wake from a NON-channel source in that window
+   * (heartbeat, workspace/drop event, reminder) freezes the turn with no
+   * locus, and the agent's plain speech is archived instead of delivered —
+   * the known gap in connectome-host docs/LOCUS-ROUTING-DESIGN.md
+   * ("Interim state (acceptable)"). Deployments where the agent has ONE door
+   * name it here; multi-surface deployments leave it unset and keep the
+   * never-guess behavior.
+   */
+  fallbackLocusChannel?: string;
 }
 
 // ============================================================================
@@ -363,6 +380,7 @@ export class ChannelRegistry {
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
   private activeChannelResolver?: (agentName: string) => string | undefined;
+  private fallbackLocusChannel?: string;
   private store?: JsStore;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
@@ -415,6 +433,7 @@ export class ChannelRegistry {
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
+    this.fallbackLocusChannel = options?.fallbackLocusChannel;
     this.store = options?.store;
     this.initializeLifecycleStore();
   }
@@ -914,7 +933,7 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = home ?? active ?? this.defaultPublishChannel ?? this.fallbackLocusChannel ?? null;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1762,8 +1781,9 @@ export class ChannelRegistry {
    * the speech simply stays in chronicle + module surfaces).
    */
   /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
-   *  process-global default). Public so a multi-segment caller can snapshot it
-   *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
+   *  process-global most-recent-inbound → configured `fallbackLocusChannel`).
+   *  Public so a multi-segment caller can snapshot it ONCE and pin every
+   *  segment to it via routeSpeech's `overrideChannelId`. */
   /**
    * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
    * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
@@ -1819,7 +1839,11 @@ export class ChannelRegistry {
 
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    return home
+      ?? this.activeChannelResolver?.(conversationId)
+      ?? this.defaultPublishChannel
+      ?? this.fallbackLocusChannel
+      ?? null;
   }
 
   async routeSpeech(

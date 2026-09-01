@@ -135,6 +135,20 @@ export interface FrameworkConfig {
   gate?: GateOptions;
 
   /**
+   * Static last-resort outbound locus for plain-text speech: the channel id
+   * used when a turn has no home channel, no triggering channel, and no
+   * most-recent inbound (`defaultPublishChannel`, which is in-memory and so
+   * `null` from a restart until the first inbound message arrives).
+   *
+   * Without it, a wake from a non-channel source in that window — heartbeat,
+   * workspace event, reminder — routes nowhere and the reply is archived
+   * instead of delivered. Set it only for deployments with ONE canonical
+   * door; leave it unset for multi-surface agents, which must keep the
+   * never-guess behavior.
+   */
+  fallbackLocusChannel?: string;
+
+  /**
    * Liveness watchdog: fail hard (and let the supervisor restart) if the main
    * thread wedges — a synchronous infinite loop or microtask flood that would
    * otherwise leave the agent silently deaf. Off unless `enabled` is set.
