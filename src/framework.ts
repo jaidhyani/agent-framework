@@ -4154,7 +4154,7 @@ export class AgentFramework {
    * Convert an MCPL push event to a context message.
    */
   private handleMcplPushEvent(event: McplPushEvent): void {
-    const triggerChannel = this.derivePushEventChannel(event.origin);
+    const triggerChannel = this.derivePushEventChannel(event.origin, event.serverId);
     if (triggerChannel && this.channelRegistry) {
       this.channelRegistry.ensureChannelRegistered(
         event.serverId,
@@ -4238,9 +4238,21 @@ export class AgentFramework {
    * fix works even against a discord-mcpl build that predates `mcplChannelId`.
    * Returns undefined for push events with no channel provenance (heartbeats,
    * timers), which correctly keep the global fallback.
+   *
+   * NEVER GUESS THE GUILD/DM DISPOSITION. A missing `guildId` is not evidence
+   * of a DM: discord-mcpl's message-edit and message-delete events send only
+   * `{ source: 'discord', channelId }`, and its reconnect sweep sends
+   * `guildId: null` whenever the channel's guild could not be resolved from
+   * cache. Reading either as "DM" minted `discord:dm:{guild channel snowflake}`
+   * — an address that exists nowhere — and then pinned it as the turn's locus
+   * (live 2026-09-01: an edit in #clai flipped Saga's routing header to
+   * `discord:dm:1539044599962538124`). With no usable provenance we now look
+   * the raw id up among ALREADY-REGISTERED channels, and failing that return
+   * undefined so the event leaves the locus alone.
    */
   private derivePushEventChannel(
     origin: Record<string, unknown> | undefined,
+    serverId?: string,
   ): { channelId: string; label?: string; metadata?: Record<string, unknown> } | undefined {
     if (!origin) return undefined;
     let label = typeof origin.channelName === 'string' && origin.channelName ? origin.channelName : undefined;
@@ -4249,7 +4261,9 @@ export class AgentFramework {
     // A DM has no channelName — label it by the PERSON and carry their
     // identity, so DM registrations are people-first (`DM: antra`, matchable
     // by `>>@name` / `<@id>` mention tokens) instead of bare snowflakes.
-    const isDM = origin.isDM === true || origin.guildId === null;
+    // `guildId: null` still counts as a DM signal (older surfaces sent nothing
+    // else), but only when an explicit `isDM: false` does not contradict it.
+    const isDM = origin.isDM === true || (origin.guildId === null && origin.isDM !== false);
     if (isDM && typeof origin.authorName === 'string' && origin.authorName) {
       label = label ?? `DM: ${origin.authorName}`;
       metadata = {
@@ -4266,16 +4280,30 @@ export class AgentFramework {
       return { channelId: explicit, ...(label ? { label } : {}), ...(metadata ? { metadata } : {}) };
     }
 
-    // Discord fallback: reconstruct the composite from origin parts. `guildId`
-    // is null for a DM (→ 'dm'); a real guild id for a non-open guild channel.
+    // Discord fallback: reconstruct the composite from origin parts — but only
+    // when the origin actually says which it is. A real guild id gives the
+    // guild form; a positive DM signal gives the 'dm' form; anything else has
+    // no disposition to reconstruct from (see the note above).
     if (origin.source === 'discord' && typeof origin.channelId === 'string' && origin.channelId) {
-      const guild =
-        typeof origin.guildId === 'string' && origin.guildId ? origin.guildId : 'dm';
-      return {
-        channelId: `discord:${guild}:${origin.channelId}`,
-        ...(label ? { label } : {}),
-        ...(metadata ? { metadata } : {}),
-      };
+      const guild = typeof origin.guildId === 'string' && origin.guildId ? origin.guildId : undefined;
+      if (guild || isDM) {
+        return {
+          channelId: `discord:${guild ?? 'dm'}:${origin.channelId}`,
+          ...(label ? { label } : {}),
+          ...(metadata ? { metadata } : {}),
+        };
+      }
+    }
+
+    // No disposition. If this raw channel is already registered — the usual
+    // case for an edit or a delete, whose original message arrived first — use
+    // the composite id we already hold. Unique match only; ambiguity fails
+    // closed to "no channel", never to a guess.
+    if (serverId && typeof origin.channelId === 'string' && origin.channelId) {
+      const known = this.channelRegistry?.findRegisteredByRawId(serverId, origin.channelId);
+      if (known) {
+        return { channelId: known, ...(label ? { label } : {}), ...(metadata ? { metadata } : {}) };
+      }
     }
 
     return undefined;

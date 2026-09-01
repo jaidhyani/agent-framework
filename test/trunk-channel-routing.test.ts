@@ -32,6 +32,7 @@ function internals(framework: AgentFramework) {
     pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number; channelId?: string }>;
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
+      serverId?: string,
     ): { channelId: string; label?: string } | undefined;
     channelRegistry: unknown;
     handleMcplPushEvent(event: unknown): void;
@@ -129,6 +130,53 @@ describe('Trunk channel routing (item-3 redux)', () => {
       guildId: 'G1',
     });
     assert.deepEqual(got, { channelId: 'discord:G1:C7' });
+    await framework.stop();
+  });
+
+  it('derivePushEventChannel refuses to mint a dm: address without a DM signal', async () => {
+    // discord-mcpl's message-edit / message-delete events carry only
+    // { source, channelId }. Before the fix, the missing guildId defaulted to
+    // 'dm' and produced `discord:dm:{guild channel snowflake}` — a malformed
+    // locus that then got pinned for the turn (live 2026-09-01, #clai).
+    const framework = await makeFramework();
+    const i = internals(framework);
+    assert.equal(
+      i.derivePushEventChannel({ source: 'discord', channelId: '1539044599962538124' }),
+      undefined,
+    );
+    // The reconnect sweep's cache-miss shape: guildId null but isDM false.
+    assert.equal(
+      i.derivePushEventChannel({ source: 'discord', channelId: 'C7', guildId: null, isDM: false }),
+      undefined,
+    );
+    await framework.stop();
+  });
+
+  it('derivePushEventChannel recovers a provenance-less push from the registry', async () => {
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const asked: Array<[string, string]> = [];
+    i.channelRegistry = {
+      findRegisteredByRawId: (serverId: string, rawChannelId: string) => {
+        asked.push([serverId, rawChannelId]);
+        return rawChannelId === '1539044599962538124' ? 'discord:G1:1539044599962538124' : null;
+      },
+      stopAll: () => {},
+    };
+
+    // An edit in a channel whose original message already arrived resolves to
+    // the composite the registry already holds — not a guess.
+    assert.deepEqual(
+      i.derivePushEventChannel({ source: 'discord', channelId: '1539044599962538124' }, 'discord'),
+      { channelId: 'discord:G1:1539044599962538124' },
+    );
+    assert.deepEqual(asked, [['discord', '1539044599962538124']]);
+
+    // An unknown raw id still yields nothing (the locus stays where it was).
+    assert.equal(
+      i.derivePushEventChannel({ source: 'discord', channelId: '999' }, 'discord'),
+      undefined,
+    );
     await framework.stop();
   });
 

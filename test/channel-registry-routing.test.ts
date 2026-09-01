@@ -495,3 +495,53 @@ test('DM prose targets resolve people-first: @name, prefix-lenient names, and <@
   assert.ok('error' in missing && /send_dm/.test(missing.error), 'no-match points at send_dm');
   assert.ok('error' in missing && (missing.candidates?.length ?? 0) === 2, 'lists known DMs by name');
 });
+
+test('findRegisteredByRawId maps a raw surface id back to its composite, and fails closed on ambiguity', () => {
+  const { registry } = makeRegistry({ delivered: true });
+
+  registry.ensureChannelRegistered('discord', 'discord:G1:1539044599962538124', '#clai');
+  registry.ensureChannelRegistered('discord', 'discord:dm:42', 'DM: antra');
+
+  // The lookup a provenance-less push event (message edit/delete) depends on.
+  assert.equal(
+    registry.findRegisteredByRawId('discord', '1539044599962538124'),
+    'discord:G1:1539044599962538124',
+  );
+  assert.equal(registry.findRegisteredByRawId('discord', '42'), 'discord:dm:42');
+
+  // Unknown, wrong server, and empty all yield null rather than a guess.
+  assert.equal(registry.findRegisteredByRawId('discord', '999'), null);
+  assert.equal(registry.findRegisteredByRawId('zulip', '42'), null);
+  assert.equal(registry.findRegisteredByRawId('discord', ''), null);
+
+  // Same raw snowflake registered under two composites — never guess.
+  registry.ensureChannelRegistered('discord', 'discord:G2:1539044599962538124', '#clai-elsewhere');
+  assert.equal(registry.findRegisteredByRawId('discord', '1539044599962538124'), null);
+});
+
+test('handleToolPublish reports delivered:false as a failure instead of success', async () => {
+  const { registry } = makeRegistry({ delivered: false });
+  registry.ensureChannelRegistered('discord', 'discord:G1:C7', '#clai');
+
+  const result = await (registry as unknown as {
+    handleToolPublish(input: { channelId?: string; content?: string }): Promise<{
+      success: boolean; error?: string; isError?: boolean; data?: unknown;
+    }>;
+  }).handleToolPublish({ channelId: 'discord:G1:C7', content: 'did this land?' });
+
+  assert.equal(result.success, false);
+  assert.equal(result.isError, true);
+  assert.match(result.error ?? '', /delivered:false/);
+});
+
+test('handleToolPublish still reports success when the server delivers', async () => {
+  const { registry, publishCalls } = makeRegistry({ delivered: true });
+  registry.ensureChannelRegistered('discord', 'discord:G1:C7', '#clai');
+
+  const result = await (registry as unknown as {
+    handleToolPublish(input: { channelId?: string; content?: string }): Promise<{ success: boolean }>;
+  }).handleToolPublish({ channelId: 'discord:G1:C7', content: 'hello' });
+
+  assert.equal(result.success, true);
+  assert.equal(publishCalls.at(-1)?.channelId, 'discord:G1:C7');
+});

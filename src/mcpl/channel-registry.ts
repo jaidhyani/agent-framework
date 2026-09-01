@@ -1258,6 +1258,32 @@ export class ChannelRegistry {
    * Find a channel entry by channelId (searches across all servers).
    * Returns the first match.
    */
+  /**
+   * Find an already-registered composite channel id from a surface-internal RAW
+   * id (e.g. a bare Discord snowflake), by matching the composite's trailing
+   * `:{rawId}` segment on a given server.
+   *
+   * Exists for push events whose `origin` carries a raw `channelId` but no
+   * guild/DM provenance — discord-mcpl's message-edit and message-delete events
+   * send `{ source: 'discord', channelId }` and nothing else. Without this the
+   * framework can only guess, and guessing minted `discord:dm:{guild channel}`
+   * (see derivePushEventChannel). If the channel is already known — and for an
+   * edit or a delete it almost always is, since the message being edited had to
+   * arrive first — its real composite id is right here.
+   *
+   * Fails closed on ambiguity (more than one match): the same never-guess rule
+   * that governs delivery.
+   */
+  findRegisteredByRawId(serverId: string, rawChannelId: string): string | null {
+    if (!rawChannelId) return null;
+    const suffix = `:${rawChannelId}`;
+    const matches = [...this.channels.values()]
+      .filter((entry) => entry.serverId === serverId && entry.descriptor.id.endsWith(suffix))
+      .map((entry) => entry.descriptor.id);
+    const unique = [...new Set(matches)];
+    return unique.length === 1 ? unique[0]! : null;
+  }
+
   private findChannelEntry(channelId: string): ChannelEntry | undefined {
     for (const [key, entry] of this.channels) {
       if (entry.descriptor.id === channelId) {
@@ -2012,6 +2038,28 @@ export class ChannelRegistry {
       };
 
       const result = await server.sendChannelsPublish(publishParams);
+      // The server can accept the publish RPC and still report the message was
+      // not delivered (missing Send Messages permission, channel archived, a
+      // closed locus the surface refused). Reporting `success: true` there told
+      // the agent its message had landed when it had not — the one failure it
+      // cannot detect any other way. routeSpeech has surfaced this since the
+      // delivered:false fix; the tool path had not.
+      //
+      // NOT changed here on purpose: routeSpeech also OPENS a closed locus
+      // before delivering ("speech implies engagement"). The tool path keeps
+      // sending without opening, because `channel_publish` with an explicit
+      // channelId is exactly how an agent answers in a channel it has chosen
+      // not to join (the "reply without joining" option in the closed-channel
+      // invitation). Auto-joining there would subscribe it to inbound traffic
+      // it deliberately declined — a policy change, not a bug fix.
+      const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
+      if (delivered === false) {
+        return {
+          success: false,
+          error: `Server "${entry.serverId}" accepted the publish but reported delivered:false for "${channelId}" — the message did NOT land`,
+          isError: true,
+        };
+      }
       return {
         success: true,
         data: result ?? { delivered: true },
