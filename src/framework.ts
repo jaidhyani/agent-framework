@@ -8142,6 +8142,30 @@ export class AgentFramework {
       }
     }
 
+    // [local patch 2026-09-01 clai] Trunk agents: a channel_publish with no
+    // channelId must land on the turn's locus (home → trigger channel →
+    // most-recent inbound → configured fallbackLocusChannel, frozen at turn
+    // start into turnLocusPins), not on the raw
+    // process-global defaultPublishChannel that handleToolPublish falls back
+    // to. That fallback tracks only SUBSCRIBED inbound, so a reply to a mention
+    // in an unsubscribed channel landed in whichever channel last had
+    // subscribed traffic (Aesop, 2026-08-02: #journal-club → #kitchen-table),
+    // and right after a boot it is null. This is the tool-path half of the
+    // fallback-locus fix; routeSpeech already resolves the same way.
+    if (!home && call.name === 'channel_publish') {
+      const input = (call.input ?? {}) as { channelId?: string };
+      if (!input.channelId) {
+        // Read the turn's FROZEN pin (set at turn start, framework.ts
+        // startAgentStream), never re-resolve live: a late dispatch resolving
+        // live can read the next turn's trigger or a moved global default —
+        // the item-3 / 2026-07-22 Sol DM misroute routeSpeech's contract
+        // guards against. Same convention as dispatchSleepToolCall. Agents in
+        // explicit-prose routing have no pin and fall through unchanged.
+        const locus = this.turnLocusPins.get(agentName) ?? null;
+        if (locus !== null) call = { ...call, input: { ...input, channelId: locus } };
+      }
+    }
+
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
 
